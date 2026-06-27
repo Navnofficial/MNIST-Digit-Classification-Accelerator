@@ -51,6 +51,198 @@ Weights are INT4 packed two per byte. Biases are INT16. Activations are clamped 
 
 ---
 
+## Design Optimizations for Legacy FPGA
+
+The Altera DE2 (Cyclone II EP2C35F672C6) is a device from 2004 with no hardened DSP multiplier arrays, no block RAM for weight storage, limited LE count (33,216), and a 50 MHz clock ceiling. Running a 110,912-MAC neural network entirely inside this chip requires a set of deliberate engineering decisions. Every optimization below is directly traceable to code in `rtl/mnist_top.v`.
+
+---
+
+### 1. INT4 Weight Quantization — 2 Weights per Byte
+
+**The problem:** Storing FC1 weights as full 32-bit floats would require 784 x 128 x 4 = 401,408 bytes. The EP2C35 has only 483,840 bits (about 60 KB) of on-chip block RAM — and zero embedded multipliers capable of float arithmetic.
+
+**The fix:** Weights are quantized to signed 4-bit integers (range -8 to +7) and packed two per byte, cutting weight storage to 55,456 bytes — approximately 6.9x smaller. The Fitter places the entire weight ROM in distributed logic registers rather than block RAM, using 0 M4K blocks.
+
+```verilog
+// Two INT4 weights per byte — low nibble = even index, high nibble = odd
+rom_byte = fc1_w[flat[16:1]];
+w_val    = flat[0] ? $signed(rom_byte[7:4]) : $signed(rom_byte[3:0]);
+```
+
+The nibble index is computed from a single bit (`flat[0]`), so there is no division or modulo hardware needed — just a mux.
+
+---
+
+### 2. Sequential MAC Engine — One Multiply per Clock Cycle
+
+**The problem:** A parallel MAC array for FC1 alone (784 multipliers running simultaneously) would require hundreds of 8x4-bit multipliers — far beyond what the EP2C35 can map.
+
+**The fix:** A single shared MAC unit processes one weight-activation product per clock cycle, accumulating into a 23-bit signed register. All 110,912 MACs are time-multiplexed across the same hardware unit:
+
+```verilog
+// Single MAC — one product per clock
+prod = $signed(w_val) * $signed(x_val);   // 4-bit x 8-bit = 11-bit
+acc <= acc + {{12{prod[10]}}, prod};       // sign-extended into 23-bit acc
+```
+
+This uses only 2 embedded 9-bit multiplier elements (3% of the 70 available), leaving logic elements free for the FSM and buffers.
+
+---
+
+### 3. Bias Pre-loaded into Accumulator — Zero Extra Adder Cycles
+
+**The problem:** Adding a 16-bit bias to each neuron's accumulator after the MAC loop would require an extra clock cycle per neuron — adding 234 wasted cycles per inference.
+
+**The fix:** Each neuron's accumulator is initialized directly with the bias value (sign-extended to 23 bits) at the start of its MAC loop, so the bias is added for free with no additional cycle:
+
+```verilog
+// Bias loaded into acc before the MAC loop starts — no extra cycle
+acc <= {{7{fc1_b[neuron_idx+1][15]}}, fc1_b[neuron_idx+1]};
+```
+
+This is done for every layer transition and for every neuron at the point the previous neuron finishes.
+
+---
+
+### 4. Store-Neuron Flag — Pipeline the Writeback
+
+**The problem:** Writing the ReLU result back to the activation buffer on the same clock cycle as the last MAC would create a data hazard — the accumulator result is not yet stable.
+
+**The fix:** A one-cycle delayed `store_neuron` flag separates the final MAC cycle from the writeback cycle. The flag is set on the last MAC, and the actual clamp-and-store happens one cycle later:
+
+```verilog
+if (input_idx == 10'd783) begin
+    input_idx    <= 0;
+    store_neuron <= 1;   // flag: writeback happens next cycle
+end
+
+if (store_neuron) begin
+    store_neuron <= 0;
+    if      (acc <= 0)   a1[neuron_idx] <= 8'sd0;
+    else if (acc > 127)  a1[neuron_idx] <= 8'sd127;
+    else                 a1[neuron_idx] <= acc[7:0];
+    ...
+end
+```
+
+This avoids a read-after-write hazard and ensures exact hardware-software matching.
+
+---
+
+### 5. Signed INT8 Activation Clamping — No Dividers or Softmax in Hardware
+
+**The problem:** Standard neural network activations use floating-point ReLU and softmax. Neither is feasible on a legacy FPGA without floating-point IP cores.
+
+**The fix:** ReLU is replaced by a simple clamp to `[0, 127]` using two comparators — negative values go to 0, values above 127 are capped at 127. This maps to two comparator chains in logic and zero DSP resources:
+
+```verilog
+if      (acc <= 0)   a1[n] <= 8'sd0;    // ReLU
+else if (acc > 127)  a1[n] <= 8'sd127;  // saturation clamp
+else                 a1[n] <= acc[7:0];
+```
+
+The upper bound of 127 keeps activations in the positive half of a signed 8-bit register, preventing sign-bit corruption when activations are used as the next layer's inputs.
+
+---
+
+### 6. Pixel Values Scaled to [0, 127] — Hardware-Safe Input Format
+
+**The problem:** Standard MNIST pixels are in [0, 255]. The Verilog activation registers are `reg signed [7:0]`, so a pixel value of 128 or above would be interpreted as a negative number, corrupting the first-layer MACs.
+
+**The fix:** The PC-side Python client scales all pixel values from [0, 255] down to [0, 127] before sending over UART. This is a preprocessing contract enforced in both `fpga_client_28.py` and the simulator:
+
+```python
+out = np.clip(np.array(canvas, dtype=np.float32) / 255.0 * 127, 0, 127).astype(np.uint8)
+```
+
+The hardware then treats every pixel as a non-negative signed 8-bit value, which is always correct in the `$signed(x_val)` multiply.
+
+---
+
+### 7. Inline Argmax — No Softmax Hardware Required
+
+**The problem:** Softmax requires exponentials — completely impractical on this device without floating-point support.
+
+**The fix:** After FC4, only the argmax (index of the largest logit) matters for classification. A 10-step sequential comparator runs immediately after the final MAC, requiring only one comparator and 16-bit registers:
+
+```verilog
+if ($signed(logit[am_cnt]) > $signed(max_val)) begin
+    max_val <= logit[am_cnt];
+    max_idx <= am_cnt;
+end
+```
+
+This adds only 10 clock cycles to inference and uses negligible logic.
+
+---
+
+### 8. Logit Truncation to 16-bit — Preventing Register Overflow
+
+**The problem:** The 23-bit accumulator in FC4 can exceed the range of a 16-bit register. Storing full 23-bit logits for all 10 output neurons would require 230 bits of activation storage.
+
+**The fix:** FC4 logits are stored as the lower 16 bits of the accumulator (`acc[15:0]`), sign-extended for correct comparison. The Python simulator mirrors this truncation exactly:
+
+```verilog
+logit[neuron_idx[3:0]] <= acc[15:0];
+```
+
+```python
+logits_trunc = logits_raw & 0xFFFF
+logits_trunc = np.where(logits_trunc >= 0x8000, logits_trunc - 0x10000, logits_trunc)
+```
+
+This bit-exact match ensures the Python simulator produces identical predictions to the hardware.
+
+---
+
+### 9. Dual Flip-Flop Metastability Synchronizer on UART RX
+
+**The problem:** The UART RX line is an asynchronous signal entering the FPGA's synchronous clock domain. A single flip-flop sampling may catch a metastable state and propagate corrupted data.
+
+**The fix:** The RX signal passes through two cascaded flip-flops (`s0`, `s1`) before use. This is the industry-standard dual-FF synchronizer and reduces the probability of metastability propagation to negligible levels:
+
+```verilog
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin s0<=1; s1<=1; end
+    else        begin s0<=rx; s1<=s0; end
+end
+```
+
+---
+
+### 10. Hardware Checksum Validation — Corrupt Packet Rejection
+
+**The problem:** At 115200 baud over GPIO pins with no ESD protection, bit errors in the 786-byte pixel packet are possible. Sending a corrupted image to the MLP would produce a wrong prediction silently.
+
+**The fix:** The PC computes a 1-byte checksum (sum of all 784 pixel bytes, modulo 256) and appends it to the packet. The FPGA accumulates the same sum during reception and compares:
+
+```verilog
+rsum <= rsum + rx_byte;          // 8-bit accumulating checksum
+...
+chksum_ok <= (rx_byte == rsum);  // validate last byte
+```
+
+On mismatch, the FPGA responds with `0xFF` instead of a digit, and the client displays an error.
+
+---
+
+### Summary
+
+| Optimization | What it solves | Where in code |
+|---|---|---|
+| INT4 weight packing (2 per byte) | Fits 55 KB weight ROM into logic registers | `fc1_w[flat[16:1]]`, nibble mux |
+| Single sequential MAC unit | Avoids parallel multiplier array — uses only 2 DSP blocks | `prod = w_val * x_val; acc <= acc + prod` |
+| Bias pre-loaded into accumulator | Zero extra cycles for bias addition | `acc <= {{7{bias[15]}}, bias}` at loop start |
+| Store-neuron delay flag | Clean writeback without data hazard | `store_neuron` register, 1-cycle delay |
+| ReLU as integer clamp [0, 127] | No floating-point hardware needed | `if acc<=0 then 0; if acc>127 then 127` |
+| Pixel scaling to [0, 127] | Prevents signed overflow in 8-bit input registers | Python preprocessing before UART send |
+| Inline argmax (10 cycles) | No softmax hardware required | `do_argmax` FSM, `max_val`/`max_idx` regs |
+| 16-bit logit truncation | Reduces output register width | `logit[n] <= acc[15:0]` |
+| Dual-FF synchronizer on RX | Prevents metastability from async UART input | `s0 <= rx; s1 <= s0` |
+| 8-bit packet checksum | Detects corrupt pixel data before inference | `rsum` accumulator, `chksum_ok` flag |
+
+---
+
 ## Model Accuracy Report
 
 Test set: 10,000 MNIST samples. Quantized INT4 weights with INT16 biases.
