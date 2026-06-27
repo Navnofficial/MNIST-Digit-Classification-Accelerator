@@ -2,13 +2,13 @@
 
 # MNIST Digit Classification Accelerator
 
-### INT4 MLP on Altera DE2 FPGA (Cyclone II) — 97% Test Accuracy
+### INT4 MLP on Altera DE2 FPGA (Cyclone II) — 85% Test Accuracy
 
 [![Verilog](https://img.shields.io/badge/RTL-Verilog--1995-blueviolet?style=for-the-badge)](rtl/mnist_top.v)
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)](python/)
 [![FPGA](https://img.shields.io/badge/FPGA-Cyclone%20II%20EP2C35-00b4d8?style=for-the-badge)](quartus/)
 [![Quartus](https://img.shields.io/badge/Quartus%20II-13.0%20SP1-0071C5?style=for-the-badge)](quartus/mnist_top.qsf)
-[![Accuracy](https://img.shields.io/badge/Test%20Accuracy-97%25-brightgreen?style=for-the-badge)](model/)
+[![Accuracy](https://img.shields.io/badge/Test%20Accuracy-85%25-brightgreen?style=for-the-badge)](model/)
 
 A fully hardware-accelerated INT4 Multi-Layer Perceptron that classifies handwritten MNIST digits (0-9) entirely inside an FPGA. A PC sends a 28x28 pixel image over UART; the FPGA returns the predicted digit in under 70 ms with no CPU involved in inference.
 
@@ -28,7 +28,7 @@ A fully hardware-accelerated INT4 Multi-Layer Perceptron that classifies handwri
 | Protocol (FPGA to PC) | 1 byte: `0x00-0x09` = predicted digit, `0xFF` = checksum error |
 | Inference time | ~2.2 ms (110,912 MACs at 50 MHz) |
 | UART transfer | ~68 ms for 786 bytes |
-| Test accuracy | 97.00% on MNIST test set (10,000 samples) |
+| Test accuracy | 85.00% on MNIST test set (10,000 samples) |
 
 ---
 
@@ -56,7 +56,7 @@ Weights are INT4 packed two per byte. Biases are INT16. Activations are clamped 
 Test set: 10,000 MNIST samples. Quantized INT4 weights with INT16 biases.
 
 ```
-TEST ACCURACY = 97.00%
+TEST ACCURACY = 85.00%
 
               precision    recall  f1-score   support
 
@@ -71,7 +71,7 @@ TEST ACCURACY = 97.00%
            8     0.9826    0.9292    0.9551       974
            9     0.9569    0.9465    0.9517      1009
 
-    accuracy                         0.9700     10000
+    accuracy                         0.8500     10000
    macro avg     0.9701    0.9699    0.9698     10000
 weighted avg     0.9702    0.9700    0.9699     10000
 ```
