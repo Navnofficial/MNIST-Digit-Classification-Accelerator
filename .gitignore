@@ -1,0 +1,52 @@
+# ── Quartus build artifacts ──────────────────────────────────────────────────
+db/
+incremental_db/
+*.sof
+*.pof
+*.jdi
+*.pin
+*.rpt
+*.smsg
+*.summary
+*.done
+*.flow.rpt
+*.asm.rpt
+*.fit.rpt
+*.fit.smsg
+*.fit.summary
+*.map.rpt
+*.map.smsg
+*.map.summary
+*.sta.rpt
+*.sta.summary
+*.qws
+*.bak
+*.v.bak
+
+# ── MNIST raw dataset (large binary files) ───────────────────────────────────
+data/MNIST/raw/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+env/
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.suo
+*.user
